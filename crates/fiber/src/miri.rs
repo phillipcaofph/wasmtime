@@ -1,16 +1,12 @@
-//! A dummy implementation of fibers when running with MIRI to use a separate
-//! thread as the implementation of a fiber.
+//! A thread-based implementation of fibers, used to emulate fibers under Miri
+//! and by the experimental thread-backed backend.
 //!
-//! Note that this technically isn't correct because it means that the code
-//! running in the fiber won't share TLS variables with the code managing the
-//! fiber, but it's enough for now.
+//! Under Miri, this is an approximation: code running in a fiber does not share
+//! TLS with the code managing the fiber.
 //!
-//! The general idea is that a thread is held in a suspended state to hold the
-//! state of the stack on that thread. When a fiber is resumed that thread
-//! starts executing and the caller stops. When a fiber suspends then that
-//! thread stops and the original caller returns. There's still possible minor
-//! amounts of parallelism but in general they should be quite scoped and not
-//! visible from the caller/callee really.
+//! Each fiber keeps a worker thread to hold its execution stack. Resuming wakes
+//! that worker while the caller waits; suspending parks the worker and returns
+//! control to the caller.
 //!
 //! An issue was opened at rust-lang/miri#4392 for a possible extension to miri
 //! to support stack-switching in a first-class manner.
@@ -21,8 +17,42 @@ use std::cell::Cell;
 use std::io;
 use std::mem;
 use std::ops::Range;
+#[cfg(wasmtime_thread_fibers)]
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread::{self, JoinHandle};
+
+#[cfg(all(test, wasmtime_thread_fibers))]
+std::thread_local! {
+    static FAIL_NEXT_SPAWN: Cell<bool> = const { Cell::new(false) };
+}
+
+#[cfg(all(test, wasmtime_thread_fibers))]
+pub(super) fn fail_next_spawn_for_test() {
+    FAIL_NEXT_SPAWN.set(true);
+}
+
+#[cfg(all(test, wasmtime_thread_fibers))]
+pub(super) fn stack_size_for_test(stack: &FiberStack) -> usize {
+    stack.0
+}
+
+#[cfg(wasmtime_thread_fibers)]
+static STARTED: AtomicU64 = AtomicU64::new(0);
+#[cfg(wasmtime_thread_fibers)]
+static LIVE: AtomicU64 = AtomicU64::new(0);
+
+#[cfg(wasmtime_thread_fibers)]
+#[unsafe(no_mangle)]
+pub extern "C" fn wasmtime_thread_fiber_started() -> u64 {
+    STARTED.load(Ordering::SeqCst)
+}
+
+#[cfg(wasmtime_thread_fibers)]
+#[unsafe(no_mangle)]
+pub extern "C" fn wasmtime_thread_fiber_live() -> u64 {
+    LIVE.load(Ordering::SeqCst)
+}
 
 pub use wasmtime_environ::error::Error;
 
@@ -30,6 +60,10 @@ pub struct FiberStack(usize);
 
 impl FiberStack {
     pub fn new(size: usize, _zeroed: bool) -> Result<Self> {
+        #[cfg(wasmtime_thread_fibers)]
+        if size > isize::MAX as usize {
+            return Err(io::Error::from(io::ErrorKind::InvalidInput).into());
+        }
         Ok(FiberStack(size))
     }
 
@@ -88,27 +122,60 @@ enum State<A, B, C> {
     Exiting,
 }
 
+#[cfg(not(wasmtime_thread_fibers))]
 unsafe impl<A, B, C> Send for State<A, B, C> {}
+#[cfg(not(wasmtime_thread_fibers))]
 unsafe impl<A, B, C> Sync for State<A, B, C> {}
 
 struct IgnoreSendSync<T>(T);
 
 unsafe impl<T> Send for IgnoreSendSync<T> {}
+#[cfg(not(wasmtime_thread_fibers))]
 unsafe impl<T> Sync for IgnoreSendSync<T> {}
+
+#[cfg(wasmtime_thread_fibers)]
+pub trait ThreadMessage: Send {}
+#[cfg(wasmtime_thread_fibers)]
+impl<T: Send> ThreadMessage for T {}
+#[cfg(not(wasmtime_thread_fibers))]
+pub trait ThreadMessage {}
+#[cfg(not(wasmtime_thread_fibers))]
+impl<T> ThreadMessage for T {}
 
 fn run<F, A, B, C>(state: Arc<SharedFiberState<A, B, C>>, func: IgnoreSendSync<F>)
 where
     F: FnOnce(A, &mut super::Suspend<A, B, C>) -> C,
+    A: ThreadMessage,
+    B: ThreadMessage,
+    C: ThreadMessage,
 {
+    #[cfg(wasmtime_thread_fibers)]
+    {
+        STARTED.fetch_add(1, Ordering::SeqCst);
+        LIVE.fetch_add(1, Ordering::SeqCst);
+    }
+    #[cfg(wasmtime_thread_fibers)]
+    struct LiveThread;
+    #[cfg(wasmtime_thread_fibers)]
+    impl Drop for LiveThread {
+        fn drop(&mut self) {
+            LIVE.fetch_sub(1, Ordering::SeqCst);
+        }
+    }
+    #[cfg(wasmtime_thread_fibers)]
+    let _live = LiveThread;
     // Wait for the initial message of what to initially invoke `func` with.
     let init = {
         let mut lock = state.state.lock().unwrap();
         lock = state
             .cond
-            .wait_while(lock, |msg| !matches!(msg, State::ResumeWith(_)))
+            .wait_while(lock, |msg| {
+                !matches!(msg, State::ResumeWith(_) | State::Exiting)
+            })
             .unwrap();
         match mem::replace(&mut *lock, State::None) {
             State::ResumeWith(RunResult::Resuming(init)) => init,
+            State::Exiting => return,
             _ => unreachable!(),
         }
     };
@@ -136,6 +203,9 @@ impl Fiber {
     pub fn new<F, A, B, C>(stack: &FiberStack, func: F) -> Result<Self>
     where
         F: FnOnce(A, &mut super::Suspend<A, B, C>) -> C,
+        A: ThreadMessage,
+        B: ThreadMessage,
+        C: ThreadMessage,
     {
         // Allocate shared state between the fiber and the suspension argument.
         let state = Arc::new(SharedFiberState::<A, B, C> {
@@ -143,18 +213,24 @@ impl Fiber {
             state: Mutex::new(State::None),
         });
 
-        // Note the use of `spawn_unchecked` to work around `Send`. Technically
-        // a lie as we are sure enough sending values across threads. We don't
-        // have many other tools in MIRI though to allocate separate call stacks
-        // so we're doing the best we can.
+        // The unchecked spawn is covered by the fiber wrapper's transfer
+        // contract: thread-backed callers must ensure the closure and its
+        // captures are safe to use on the worker until it is joined. Miri uses
+        // this thread-based implementation to approximate stack switching.
+        let worker = {
+            let state = state.clone();
+            let func = IgnoreSendSync(func);
+            move || run(state, func)
+        };
+        #[cfg(all(test, wasmtime_thread_fibers))]
+        if FAIL_NEXT_SPAWN.replace(false) {
+            drop(worker);
+            return Err(io::Error::other("injected worker spawn failure").into());
+        }
         let thread = unsafe {
             thread::Builder::new()
                 .stack_size(stack.0)
-                .spawn_unchecked({
-                    let state = state.clone();
-                    let func = IgnoreSendSync(func);
-                    move || run(state, func)
-                })?
+                .spawn_unchecked(worker)?
         };
 
         // Cast the fiber back into a raw pointer to lose the type parameters
@@ -201,13 +277,16 @@ impl Fiber {
         state.cond.notify_one();
 
         // Wait for the child thread to complete.
-        self.thread.take().unwrap().join().unwrap();
+        let result = self.thread.take().unwrap().join();
 
         // Clean up our state using the type parameters we know of here.
         unsafe {
             drop(Arc::from_raw(
                 self.state.cast::<SharedFiberState<A, B, C>>(),
             ));
+        }
+        if let Err(payload) = result {
+            std::panic::resume_unwind(payload);
         }
     }
 }

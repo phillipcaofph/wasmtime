@@ -95,7 +95,7 @@ pub use exception::*;
 pub use externals::*;
 pub use func::*;
 pub use gc::*;
-pub use instance::{Instance, InstancePre};
+pub use instance::{AsyncStoreData, Instance, InstancePre};
 pub use instantiate::CompiledModule;
 pub use limits::*;
 pub use linker::*;

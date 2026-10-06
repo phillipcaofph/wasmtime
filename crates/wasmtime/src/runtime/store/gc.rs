@@ -816,6 +816,17 @@ impl StoreOpaque {
         }
     }
 
+    #[cfg(all(test, wasmtime_thread_fibers, feature = "component-model-async"))]
+    pub(crate) fn parked_wasm_stack_root_count(&mut self) -> usize {
+        let mut roots = GcRootsList::default();
+        self.trace_wasm_stack_roots(&mut roots);
+        // SAFETY: exclusive Store access keeps the parked stacks and their
+        // slots alive and unchanged throughout this iteration.
+        unsafe { roots.iter() }
+            .filter(|root| root.is_on_wasm_stack())
+            .count()
+    }
+
     fn trace_wasm_stack_roots(&mut self, gc_roots_list: &mut GcRootsList) {
         log::trace!("Begin trace GC roots :: Wasm stack");
 

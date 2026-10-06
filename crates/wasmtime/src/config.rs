@@ -34,6 +34,9 @@ pub use wasmtime_environ::Inlining;
 
 pub(crate) const DEFAULT_WASM_BACKTRACE_MAX_FRAMES: NonZeroUsize = NonZeroUsize::new(20).unwrap();
 
+#[cfg(all(test, feature = "async", feature = "cranelift", feature = "wat"))]
+mod thread_tests;
+
 /// Represents the module instance allocation strategy to use.
 #[derive(Clone)]
 #[non_exhaustive]
@@ -1862,6 +1865,9 @@ impl Config {
     ///
     /// Custom memory creators are used when creating creating async instance stacks for
     /// the on-demand instance allocation strategy.
+    ///
+    /// The experimental OS-thread fiber backend rejects custom stack creators
+    /// when constructing an [`Engine`]; worker stacks are allocated by the OS.
     #[cfg(feature = "async")]
     pub fn with_host_stack(&mut self, stack_creator: Arc<dyn StackCreator>) -> &mut Self {
         self.stack_creator = Some(Arc::new(StackCreatorProxy(stack_creator)));
@@ -1899,6 +1905,10 @@ impl Config {
     ///
     /// This is notably used in conjunction with
     /// [`InstanceAllocationStrategy::Pooling`] and [`PoolingAllocationConfig`].
+    ///
+    /// The experimental OS-thread fiber backend only supports `OnDemand`.
+    /// Selecting `Pooling` is rejected when constructing an [`Engine`], even
+    /// for synchronous workloads, rather than failing later on stack allocation.
     pub fn allocation_strategy(
         &mut self,
         strategy: impl Into<InstanceAllocationStrategy>,
@@ -2790,6 +2800,23 @@ impl Config {
     }
 
     pub(crate) fn validate(&self) -> Result<(Tunables, WasmFeatures)> {
+        #[cfg(all(wasmtime_thread_fibers, feature = "pooling-allocator"))]
+        if matches!(
+            self.allocation_strategy,
+            InstanceAllocationStrategy::Pooling(_)
+        ) {
+            bail!(
+                "thread-backed execution does not support the pooling allocator; \
+                 use InstanceAllocationStrategy::OnDemand"
+            );
+        }
+        #[cfg(all(wasmtime_thread_fibers, feature = "async"))]
+        if self.stack_creator.is_some() {
+            bail!(
+                "thread-backed execution does not support custom stack creators; \
+                 remove Config::with_host_stack"
+            );
+        }
         let features = self.features();
 
         // First validate that the selected compiler backend and configuration

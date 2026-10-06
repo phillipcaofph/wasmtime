@@ -864,17 +864,47 @@ impl<'a> Instantiator<'a> {
                                         // resumes threads, etc.
                                         instance = store.start_instance(instance, callee).await?;
                                     } else {
-                                        store
-                                            .on_fiber(|store| start_raw(store, instance, callee))
-                                            .await??;
+                                        // SAFETY: This path is only reachable for async
+                                        // instantiation. Its public entrypoint requires
+                                        // `T: AsyncStoreData`, which is `Send` with
+                                        // thread-backed fibers; stock fibers stay on this
+                                        // thread and continue to support non-Send data.
+                                        unsafe {
+                                            crate::runtime::fiber::on_fiber_unchecked(
+                                                store.0,
+                                                |store| {
+                                                    start_raw(
+                                                        &mut StoreContextMut(store),
+                                                        instance,
+                                                        callee,
+                                                    )
+                                                },
+                                            )
+                                        }
+                                        .await??;
                                     }
                                 }
                                 #[cfg(not(feature = "component-model-async"))]
                                 {
                                     _ = &mut instance;
-                                    store
-                                        .on_fiber(|store| start_raw(store, instance, callee))
-                                        .await??;
+                                    // SAFETY: This path is only reachable for async
+                                    // instantiation. Its public entrypoint requires
+                                    // `T: AsyncStoreData`, which is `Send` with
+                                    // thread-backed fibers; stock fibers stay on this
+                                    // thread and continue to support non-Send data.
+                                    unsafe {
+                                        crate::runtime::fiber::on_fiber_unchecked(
+                                            store.0,
+                                            |store| {
+                                                start_raw(
+                                                    &mut StoreContextMut(store),
+                                                    instance,
+                                                    callee,
+                                                )
+                                            },
+                                        )
+                                    }
+                                    .await??;
                                 }
                             }
                             #[cfg(not(feature = "async"))]
@@ -1215,7 +1245,14 @@ impl<T: 'static> InstancePre<T> {
     //
     // TODO: needs more docs
     #[cfg(feature = "async")]
-    pub async fn instantiate_async(&self, store: impl AsContextMut<Data = T>) -> Result<Instance> {
+    #[cfg_attr(
+        wasmtime_thread_fibers,
+        doc = "The experimental OS-thread backend requires `Send` Store data, even for locally polled futures."
+    )]
+    pub async fn instantiate_async(&self, store: impl AsContextMut<Data = T>) -> Result<Instance>
+    where
+        T: crate::AsyncStoreData,
+    {
         self._instantiate(store, Asyncness::Yes).await
     }
 
