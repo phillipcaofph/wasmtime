@@ -2687,11 +2687,14 @@ impl Config {
     }
 
     pub(crate) fn validate(&self) -> Result<(Tunables, WasmFeatures)> {
+        let features = self.features();
         #[cfg(all(wasmtime_thread_fibers, feature = "pooling-allocator"))]
-        if matches!(
-            self.allocation_strategy,
-            InstanceAllocationStrategy::Pooling(_)
-        ) {
+        if features.contains(WasmFeatures::CM_ASYNC)
+            && matches!(
+                self.allocation_strategy,
+                InstanceAllocationStrategy::Pooling(_)
+            )
+        {
             bail!(
                 "thread-backed execution does not support the pooling allocator; \
                  use InstanceAllocationStrategy::OnDemand"
@@ -2704,7 +2707,6 @@ impl Config {
                  remove Config::with_host_stack"
             );
         }
-        let features = self.features();
 
         // First validate that the selected compiler backend and configuration
         // supports the set of `features` that are enabled. This will help
