@@ -55,11 +55,12 @@ not use these workers.
   without executing its body. Failed worker creation returns the original stack
   and drops captures. An unstarted capture-destructor panic is propagated to the
   dropping thread after joining and reclaiming shared state.
-- **Configuration:** Engine validation rejects pooling and custom stack
-  creators before allocator construction, even for synchronous workloads.
-  Use on-demand allocation. OS-owned stacks do not support raw/custom stack
-  allocation, actual stack-bound/guard-range reporting or active protection
-  keys. Experimental async execution requires `std`.
+- **Configuration:** Engine validation rejects pooling when component-model
+  async execution is enabled, and rejects custom stack creators before
+  allocator construction. Synchronous configurations can use pooling with
+  component-model async disabled. OS-owned stacks do not support raw/custom
+  stack allocation, actual stack-bound/guard-range reporting or active
+  protection keys. Experimental async execution requires `std`.
 
 Managed callbacks reached on a worker execute there, not on the original
 managed/UI thread. There is no callback queue. Arbitrary host TLS and thread

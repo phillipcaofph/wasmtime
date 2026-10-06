@@ -9,6 +9,7 @@ fn thread_stack_config_rejects_pooling_before_allocator_creation() {
         let mut pool = PoolingAllocationConfig::default();
         pool.total_stacks(total_stacks);
         let mut config = Config::new();
+        config.wasm_component_model_async(true);
         config.allocation_strategy(pool);
         let error = Engine::new(&config)
             .err()
@@ -18,6 +19,22 @@ fn thread_stack_config_rejects_pooling_before_allocator_creation() {
             "thread-backed execution does not support the pooling allocator; use InstanceAllocationStrategy::OnDemand"
         );
     }
+}
+
+#[cfg(all(wasmtime_thread_fibers, feature = "pooling-allocator"))]
+#[test]
+fn thread_stack_config_accepts_pooling_when_async_execution_is_disabled() -> Result<()> {
+    let mut pool = PoolingAllocationConfig::default();
+    pool.total_stacks(1)
+        .total_memories(1)
+        .total_tables(1)
+        .total_core_instances(1)
+        .total_component_instances(1);
+    let mut config = Config::new();
+    config.wasm_component_model_async(false);
+    config.allocation_strategy(pool);
+    Engine::new(&config)?;
+    Ok(())
 }
 
 struct UnexpectedStackCreator;
