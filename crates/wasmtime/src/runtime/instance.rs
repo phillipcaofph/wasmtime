@@ -197,8 +197,12 @@ impl Instance {
     /// memory allocation fails. See the `OutOfMemory` type's documentation for
     /// details on Wasmtime's out-of-memory handling.
     #[cfg(feature = "async")]
-    pub async fn new_async(
-        mut store: impl AsContextMut,
+    #[cfg_attr(
+        wasmtime_thread_fibers,
+        doc = "The experimental OS-thread backend requires `Send` Store data, even for locally polled futures."
+    )]
+    pub async fn new_async<T: crate::AsyncStoreData + 'static>(
+        mut store: impl AsContextMut<Data = T>,
         module: &Module,
         imports: &[Extern],
     ) -> Result<Instance> {
@@ -248,6 +252,8 @@ impl Instance {
     /// Internal function to create an instance and run the start function.
     ///
     /// This function's unsafety is the same as `Instance::new_raw`.
+    /// With thread-backed fibers, `T` must additionally be `Send` when
+    /// `asyncness` is `Yes`. Synchronous callers need no such bound.
     pub(crate) async unsafe fn new_started<T>(
         store: &mut StoreContextMut<'_, T>,
         module: &Module,
@@ -273,7 +279,13 @@ impl Instance {
             } else {
                 #[cfg(feature = "async")]
                 {
-                    store.on_fiber(|store| instance.start_raw(store)).await??;
+                    // SAFETY: async callers uphold the Send contract above.
+                    unsafe {
+                        crate::fiber::on_fiber_unchecked(store.0, |store| {
+                            instance.start_raw(&mut StoreContextMut(store))
+                        })
+                        .await??
+                    };
                 }
                 #[cfg(not(feature = "async"))]
                 unreachable!();
@@ -936,10 +948,17 @@ impl<T: 'static> InstancePre<T> {
     /// memory allocation fails. See the `OutOfMemory` type's documentation for
     /// details on Wasmtime's out-of-memory handling.
     #[cfg(feature = "async")]
+    #[cfg_attr(
+        wasmtime_thread_fibers,
+        doc = "The experimental OS-thread backend requires `Send` Store data, even for locally polled futures."
+    )]
     pub async fn instantiate_async(
         &self,
         mut store: impl AsContextMut<Data = T>,
-    ) -> Result<Instance> {
+    ) -> Result<Instance>
+    where
+        T: crate::AsyncStoreData,
+    {
         let mut store = store.as_context_mut();
         let imports = pre_instantiate_raw(
             &mut store.0,
@@ -958,6 +977,87 @@ impl<T: 'static> InstancePre<T> {
         }
     }
 }
+
+/// Store data accepted by asynchronous instantiation.
+///
+/// The experimental OS-thread backend requires `Send` even when the returned
+/// future is polled locally. Stock stack-switching retains its existing contract.
+#[doc(hidden)]
+#[cfg(wasmtime_thread_fibers)]
+/// A local, never-polled future must still reject non-Send Store data:
+///
+/// ```compile_fail,E0277
+/// use std::rc::Rc;
+/// use wasmtime::{Engine, Instance, Module, Store};
+/// let engine = Engine::default();
+/// let module = Module::new(&engine, "(module)").unwrap();
+/// let mut store = Store::new(&engine, Rc::new(()));
+/// let _future = Instance::new_async(&mut store, &module, &[]);
+/// ```
+///
+/// ```compile_fail,E0277
+/// use std::rc::Rc;
+/// use wasmtime::{Engine, Linker, Module, Store};
+/// let engine = Engine::default();
+/// let module = Module::new(&engine, "(module)").unwrap();
+/// let pre = Linker::<Rc<()>>::new(&engine).instantiate_pre(&module).unwrap();
+/// let mut store = Store::new(&engine, Rc::new(()));
+/// let _future = pre.instantiate_async(&mut store);
+/// ```
+///
+/// ```compile_fail,E0277
+/// use std::rc::Rc;
+/// use wasmtime::{Engine, Store};
+/// use wasmtime::component::{Component, Linker};
+/// let engine = Engine::default();
+/// let component = Component::new(&engine, "(component)").unwrap();
+/// let pre = Linker::<Rc<()>>::new(&engine).instantiate_pre(&component).unwrap();
+/// let mut store = Store::new(&engine, Rc::new(()));
+/// let _future = pre.instantiate_async(&mut store);
+/// ```
+///
+/// Async calls also require transferable Store data because Wasm runs on the
+/// worker thread even when the returned future is polled locally:
+///
+/// ```compile_fail,E0277
+/// use std::rc::Rc;
+/// use wasmtime::{Engine, Func, FuncType, Store};
+/// let engine = Engine::default();
+/// let mut store = Store::new(&engine, Rc::new(()));
+/// let func = Func::new(&mut store, FuncType::new([], []), |_, _, _| Ok(()));
+/// let _future = func.call_async(&mut store, &[], &mut []);
+/// ```
+pub trait AsyncStoreData: Send {}
+#[cfg(wasmtime_thread_fibers)]
+impl<T: Send + ?Sized> AsyncStoreData for T {}
+#[doc(hidden)]
+#[cfg(not(wasmtime_thread_fibers))]
+/// Stock fibers continue accepting non-Send Store data:
+///
+/// ```
+/// use std::rc::Rc;
+/// use std::future::Future;
+/// use std::task::{Context, Poll, Waker};
+/// use wasmtime::{Engine, Instance, Linker, Module, Store};
+/// let engine = Engine::default();
+/// let module = Module::new(&engine, "(module (func $start) (start $start))").unwrap();
+/// let mut store = Store::new(&engine, Rc::new(()));
+/// let mut cx = Context::from_waker(Waker::noop());
+/// assert!(matches!(Box::pin(Instance::new_async(&mut store, &module, &[]))
+///     .as_mut().poll(&mut cx), Poll::Ready(Ok(_))));
+/// let pre = Linker::<Rc<()>>::new(&engine).instantiate_pre(&module).unwrap();
+/// assert!(matches!(Box::pin(pre.instantiate_async(&mut store))
+///     .as_mut().poll(&mut cx), Poll::Ready(Ok(_))));
+/// let component = wasmtime::component::Component::new(&engine,
+///     "(component (core module $m (func $start) (start $start)) (core instance (instantiate $m)))").unwrap();
+/// let pre = wasmtime::component::Linker::<Rc<()>>::new(&engine)
+///     .instantiate_pre(&component).unwrap();
+/// assert!(matches!(Box::pin(pre.instantiate_async(&mut store))
+///     .as_mut().poll(&mut cx), Poll::Ready(Ok(_))));
+/// ```
+pub trait AsyncStoreData {}
+#[cfg(not(wasmtime_thread_fibers))]
+impl<T: ?Sized> AsyncStoreData for T {}
 
 /// Helper function shared between
 /// `InstancePre::{instantiate,instantiate_async}`

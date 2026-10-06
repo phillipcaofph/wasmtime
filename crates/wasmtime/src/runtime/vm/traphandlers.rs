@@ -1331,6 +1331,19 @@ pub(crate) mod tls {
             assert!(self.state.is_null());
         }
 
+        #[cfg(wasmtime_thread_fibers)]
+        pub(crate) fn is_empty(&self) -> bool {
+            self.state.is_null()
+        }
+
+        #[cfg(wasmtime_thread_fibers)]
+        pub(crate) fn assert_worker_tls_empty() {
+            assert!(
+                raw::get().is_null(),
+                "worker retained a live activation chain"
+            );
+        }
+
         /// Asserts that the current CallThreadState pointer, if present, is not
         /// in the `range` specified.
         ///
