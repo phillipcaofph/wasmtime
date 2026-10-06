@@ -1,0 +1,132 @@
+name: Publish experimental C API
+
+on:
+  push:
+    branches: [experiment/thread-backed-fibers]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: publish-experimental-thread-backed-fibers
+  cancel-in-progress: false
+
+jobs:
+  build:
+    name: Build C API for ${{ matrix.build }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - build: x86_64-linux
+            target: x86_64-unknown-linux-gnu
+            os: ubuntu-latest
+            env:
+              DOCKER_IMAGE: ./ci/docker/x86_64-linux/Dockerfile
+          - build: aarch64-linux
+            target: aarch64-unknown-linux-gnu
+            os: ubuntu-latest
+            env:
+              DOCKER_IMAGE: ./ci/docker/aarch64-linux/Dockerfile
+          - build: x86_64-macos
+            target: x86_64-apple-darwin
+            os: macos-15
+            env:
+              MACOSX_DEPLOYMENT_TARGET: "10.12"
+          - build: aarch64-macos
+            target: aarch64-apple-darwin
+            os: macos-15
+            env:
+              MACOSX_DEPLOYMENT_TARGET: "10.12"
+          - build: x86_64-windows
+            target: x86_64-pc-windows-msvc
+            os: windows-2025
+            env:
+              RUSTFLAGS: "-Ctarget-feature=+crt-static"
+          - build: aarch64-windows
+            target: aarch64-pc-windows-msvc
+            os: windows-2025
+            env:
+              RUSTFLAGS: "-Ctarget-feature=+crt-static"
+    env: ${{ matrix.env }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          submodules: true
+      - uses: ./.github/actions/docker-build-cached
+        if: matrix.env.DOCKER_IMAGE
+        with:
+          context: ci/docker
+          file: ${{ matrix.env.DOCKER_IMAGE }}
+          cache_key_prefix: docker-${{ matrix.target }}
+      - uses: ./.github/actions/install-ninja
+        if: ${{ !matrix.env.DOCKER_IMAGE }}
+      - uses: ./.github/actions/install-rust
+        with:
+          toolchain: wasmtime-ci-pinned-nightly
+      - name: Install target
+        shell: bash
+        run: |
+          rustup component add rust-src
+          rustup target add "${{ matrix.target }}"
+      - name: Build and package
+        shell: bash
+        run: |
+          ./ci/build-release-artifacts.sh "${{ matrix.build }}" "${{ matrix.target }}"
+          ./ci/build-tarballs.sh "${{ matrix.build }}" "${{ matrix.target }}"
+
+          package="wasmtime-dev-${{ matrix.build }}-c-api"
+          mkdir -p dist/native
+          if [[ -f "dist/${package}.tar.gz" ]]; then
+            tar -cJf "dist/native/${package}.tar.xz" -C dist "$package"
+          elif [[ -f "dist/${package}.zip" ]]; then
+            cp "dist/${package}.zip" dist/native/
+          else
+            echo "C API package for ${{ matrix.build }} was not produced." >&2
+            exit 1
+          fi
+      - uses: actions/upload-artifact@v6
+        with:
+          name: native-${{ matrix.build }}
+          path: dist/native/*
+          if-no-files-found: error
+
+  publish:
+    name: Publish public prerelease assets
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ github.sha }}
+      - uses: actions/download-artifact@v6
+        with:
+          pattern: native-*
+          path: native-assets
+          merge-multiple: true
+      - name: Update prerelease tag to this commit
+        env:
+          RELEASE_TAG: thread-backed-fibers
+        run: |
+          git tag -f "$RELEASE_TAG" "$GITHUB_SHA"
+          git push --force origin "refs/tags/$RELEASE_TAG"
+      - name: Create or update prerelease
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: thread-backed-fibers
+        run: |
+          gh release create "$RELEASE_TAG" \
+            --repo "$GITHUB_REPOSITORY" \
+            --target "$GITHUB_SHA" \
+            --title "Thread-backed fibers experiment" \
+            --notes "Experimental Wasmtime C API binaries for the thread-backed-fibers branch. These assets are replaced by each successful branch build." \
+            --prerelease \
+            native-assets/* ||
+          gh release upload "$RELEASE_TAG" \
+            --repo "$GITHUB_REPOSITORY" \
+            --clobber \
+            native-assets/*
