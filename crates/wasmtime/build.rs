@@ -2,6 +2,7 @@ use std::str;
 
 fn main() {
     println!("cargo:rerun-if-changed=build.rs");
+    println!("cargo:rustc-check-cfg=cfg(wasmtime_thread_fibers)");
 
     // NB: duplicating a workaround in the wasmtime-fiber build script.
     custom_cfg("asan", cfg_is("sanitize", "address"));

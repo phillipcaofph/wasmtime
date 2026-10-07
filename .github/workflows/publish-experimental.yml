@@ -74,18 +74,17 @@ jobs:
       - name: Build and package
         shell: bash
         run: |
+          export RUSTFLAGS="${RUSTFLAGS:-} --cfg wasmtime_thread_fibers"
           ./ci/build-release-artifacts.sh "${{ matrix.build }}" "${{ matrix.target }}"
-          ./ci/build-tarballs.sh "${{ matrix.build }}" "${{ matrix.target }}"
 
           package="wasmtime-dev-${{ matrix.build }}-c-api"
-          mkdir -p dist/native
-          if [[ -f "dist/${package}.tar.gz" ]]; then
-            tar -cJf "dist/native/${package}.tar.xz" -C dist "$package"
-          elif [[ -f "dist/${package}.zip" ]]; then
-            cp "dist/${package}.zip" dist/native/
+          mkdir -p "dist/$package" dist/native
+          cp LICENSE README.md "dist/$package/"
+          cp -r target/c-api-install/include target/c-api-install/lib "dist/$package/"
+          if [[ "${{ matrix.target }}" == *-windows-* ]]; then
+            (cd dist && 7z a "native/${package}.zip" "$package/")
           else
-            echo "C API package for ${{ matrix.build }} was not produced." >&2
-            exit 1
+            tar -cJf "dist/native/${package}.tar.xz" -C dist "$package"
           fi
       - uses: actions/upload-artifact@v6
         with:
