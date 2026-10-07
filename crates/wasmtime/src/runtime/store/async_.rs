@@ -225,7 +225,7 @@ impl StoreOpaque {
     }
 }
 
-impl<T> StoreContextMut<'_, T> {
+impl<T: Send> StoreContextMut<'_, T> {
     /// Executes a synchronous computation `func` asynchronously on a new fiber.
     pub(crate) async fn on_fiber<R: Send + Sync>(
         &mut self,

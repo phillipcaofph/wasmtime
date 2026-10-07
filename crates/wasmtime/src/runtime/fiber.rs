@@ -17,8 +17,21 @@ use super::module::ModuleRegistry;
 #[cfg(all(feature = "component-model-async", feature = "gc"))]
 use super::vm::GcRootsList;
 
-type WasmtimeResume = Result<NonNull<Context<'static>>>;
+#[cfg(not(wasmtime_thread_fibers))]
+type PollContext = NonNull<Context<'static>>;
+#[cfg(wasmtime_thread_fibers)]
+type PollContext = core::task::Waker;
+#[cfg(not(wasmtime_thread_fibers))]
+type WasmtimeResume = Result<PollContext>;
+#[cfg(wasmtime_thread_fibers)]
+type WasmtimeResume = (Result<PollContext>, AsyncWasmCallState);
+#[cfg(not(wasmtime_thread_fibers))]
 type WasmtimeYield = StoreFiberYield;
+#[cfg(wasmtime_thread_fibers)]
+struct WasmtimeYield {
+    reason: StoreFiberYield,
+    tls: AsyncWasmCallState,
+}
 type WasmtimeComplete = Result<()>;
 type WasmtimeSuspend = Suspend<WasmtimeResume, WasmtimeYield, WasmtimeComplete>;
 type WasmtimeFiber<'a> = Fiber<'a, WasmtimeResume, WasmtimeYield, WasmtimeComplete>;
@@ -82,7 +95,11 @@ pub(crate) struct AsyncState {
     /// handled by ensuring the signatures that work with `BlockingContext` all
     /// use constrained anonymous lifetimes that are guaranteed to be shorter
     /// than the original `Context` lifetime.
-    current_future_cx: Option<NonNull<Context<'static>>>,
+    ///
+    /// The experimental thread backend stores an owned `Waker` instead. Each
+    /// host-future poll constructs a worker-local `Context` from that waker;
+    /// no pointer into the polling thread's Context crosses the handshake.
+    current_future_cx: Option<PollContext>,
 
     /// The last fiber stack that was in use by the store.
     ///
@@ -99,14 +116,26 @@ pub(crate) struct AsyncState {
     pub(crate) async_required: bool,
 }
 
-// SAFETY: it's known that `std::task::Context` is neither `Send` nor `Sync`,
-// but despite this the storage here is purely temporary in getting these
-// pointers across function frames. The actual types are not sent across threads
-// as when a store isn't polling anything the pointer values are all set to
-// `None`. Thus if a store is being sent across threads that's done because no
-// fibers are active, and once fibers are active everything will stick within
-// the same thread.
+// SAFETY: with stack-switching fibers, `current_future_cx` is a temporary raw
+// pointer to the polling Context. It is taken by `BlockingContext` before every
+// suspension and is therefore null whenever the Store can move between polls.
+// The exclusive Store borrow serializes every access to both pointer fields.
+#[cfg(not(wasmtime_thread_fibers))]
 unsafe impl Send for AsyncState {}
+#[cfg(not(wasmtime_thread_fibers))]
+unsafe impl Sync for AsyncState {}
+
+// SAFETY: the thread backend stores an owned Waker in `current_future_cx`.
+// `current_suspend` points into the worker's stack, but is only installed while
+// `resume_fiber` gives that worker exclusive access to the Store. Every
+// suspension goes through `BlockingContext`, which takes both pointers before
+// returning control (including ReleaseStore) to the scheduler. The stack-local
+// Suspend reference remains on the parked worker stack; it is not transferred
+// through the resume/yield messages. The exclusive Store borrow serializes
+// access even when successive polls run on different scheduler threads.
+#[cfg(wasmtime_thread_fibers)]
+unsafe impl Send for AsyncState {}
+#[cfg(wasmtime_thread_fibers)]
 unsafe impl Sync for AsyncState {}
 
 impl Default for AsyncState {
@@ -163,7 +192,52 @@ pub(crate) struct BlockingContext<'a, 'b> {
     /// available. Upon resumption the context here is *optionally* provided.
     /// Cancellation is a case where it isn't passed back and a re-poll is a
     /// case where it's passed back.
+    #[cfg(not(wasmtime_thread_fibers))]
     future_cx: Option<&'a mut Context<'b>>,
+    #[cfg(wasmtime_thread_fibers)]
+    future_cx: Option<PollContext>,
+    #[cfg(wasmtime_thread_fibers)]
+    _context_lifetime: core::marker::PhantomData<&'b ()>,
+}
+
+#[cfg(wasmtime_thread_fibers)]
+std::thread_local! {
+    // Each worker owns exactly one execution stack. Never attach its activations
+    // to the polling thread, even when that thread is itself executing Wasm.
+    static WORKER_TLS: core::cell::Cell<Option<crate::vm::PreviousAsyncWasmCallState>> =
+        const { core::cell::Cell::new(None) };
+}
+
+#[cfg(wasmtime_thread_fibers)]
+fn enter_worker_tls(tls: AsyncWasmCallState) {
+    AsyncWasmCallState::assert_worker_tls_empty();
+    WORKER_TLS.with(|slot| {
+        assert!(
+            slot.take().is_none(),
+            "worker already has an activation owner"
+        );
+        slot.set(Some(unsafe { tls.push() }));
+    });
+}
+
+#[cfg(wasmtime_thread_fibers)]
+fn leave_worker_tls() -> AsyncWasmCallState {
+    let tls = WORKER_TLS.with(|slot| unsafe {
+        slot.take()
+            .expect("worker activation owner missing")
+            .restore()
+    });
+    AsyncWasmCallState::assert_worker_tls_empty();
+    tls
+}
+
+#[cfg(wasmtime_thread_fibers)]
+static TLS_SUSPENSIONS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+#[cfg(wasmtime_thread_fibers)]
+#[unsafe(no_mangle)]
+pub extern "C" fn wasmtime_thread_fiber_tls_suspensions() -> u64 {
+    TLS_SUSPENSIONS.load(core::sync::atomic::Ordering::SeqCst)
 }
 
 impl<'a, 'b> BlockingContext<'a, 'b> {
@@ -215,12 +289,20 @@ impl<'a, 'b> BlockingContext<'a, 'b> {
         // fiber and for this fiber. The "take" pattern here ensures that if
         // this `BlockingContext` context acquires the pointers then there are
         // no other instances of these pointers in use anywhere else.
+        #[cfg(not(wasmtime_thread_fibers))]
         let future_cx = unsafe { Some(state.current_future_cx.take().unwrap().as_mut()) };
+        #[cfg(wasmtime_thread_fibers)]
+        let future_cx = Some(state.current_future_cx.take().unwrap());
         let suspend = unsafe { state.current_suspend.take().unwrap().as_mut() };
 
         let mut reset = ResetBlockingContext {
             store,
-            cx: BlockingContext { future_cx, suspend },
+            cx: BlockingContext {
+                future_cx,
+                suspend,
+                #[cfg(wasmtime_thread_fibers)]
+                _context_lifetime: core::marker::PhantomData,
+            },
         };
         return f(&mut reset.store, &mut reset.cx);
 
@@ -238,12 +320,17 @@ impl<'a, 'b> BlockingContext<'a, 'b> {
                 debug_assert!(state.current_suspend.is_none());
                 state.current_suspend = Some(NonNull::from(&mut *self.cx.suspend));
 
+                #[cfg(not(wasmtime_thread_fibers))]
                 if let Some(cx) = &mut self.cx.future_cx {
                     // SAFETY: while this is changing the lifetime to `'static`
                     // it should never be used while it's `'static` given this
                     // `BlockingContext` abstraction.
                     state.current_future_cx =
                         Some(NonNull::from(unsafe { change_context_lifetime(cx) }));
+                }
+                #[cfg(wasmtime_thread_fibers)]
+                {
+                    state.current_future_cx = self.cx.future_cx.take();
                 }
             }
         }
@@ -301,7 +388,13 @@ impl<'a, 'b> BlockingContext<'a, 'b> {
     {
         let mut future = core::pin::pin!(future);
         loop {
-            match future.as_mut().poll(self.future_cx.as_mut().unwrap()) {
+            #[cfg(not(wasmtime_thread_fibers))]
+            let poll = future.as_mut().poll(self.future_cx.as_mut().unwrap());
+            #[cfg(wasmtime_thread_fibers)]
+            let poll = future
+                .as_mut()
+                .poll(&mut Context::from_waker(self.future_cx.as_ref().unwrap()));
+            match poll {
                 Poll::Ready(v) => break Ok(v),
                 Poll::Pending => self.suspend(StoreFiberYield::KeepStore)?,
             }
@@ -321,15 +414,294 @@ impl<'a, 'b> BlockingContext<'a, 'b> {
         // value given back.
         self.future_cx.take();
 
-        let mut new_future_cx: NonNull<Context<'static>> = self.suspend.suspend(yield_)?;
+        #[cfg(wasmtime_thread_fibers)]
+        {
+            let tls = leave_worker_tls();
+            if !tls.is_empty() {
+                TLS_SUSPENSIONS.fetch_add(1, core::sync::atomic::Ordering::SeqCst);
+            }
+            let (cx, tls) = self.suspend.suspend(WasmtimeYield {
+                reason: yield_,
+                tls,
+            });
+            // Cancellation must reattach the saved activations before unwinding.
+            enter_worker_tls(tls);
+            self.future_cx = Some(cx?);
+        }
 
-        // SAFETY: this function is unsafe as we're doing "funky" things to the
-        // `new_future_cx` we have been given. The safety here relies on the
-        // fact that the lifetimes of `BlockingContext` are all "smaller" than
-        // the original `Context` itself, and that should be guaranteed through
-        // the exclusive constructor of this type `BlockingContext::with`.
-        unsafe {
-            self.future_cx = Some(change_context_lifetime(new_future_cx.as_mut()));
+        #[cfg(not(wasmtime_thread_fibers))]
+        {
+            let mut new_future_cx: NonNull<Context<'static>> = self.suspend.suspend(yield_)?;
+            unsafe {
+                self.future_cx = Some(change_context_lifetime(new_future_cx.as_mut()));
+            }
+        }
+        Ok(())
+    }
+}
+
+#[cfg(all(test, wasmtime_thread_fibers, feature = "cranelift", feature = "wat"))]
+mod thread_tests {
+    use super::*;
+    use crate::{Caller, Config, Func, Instance, Module, Store};
+    use std::sync::{Arc, Mutex};
+    use std::task::{Wake, Waker};
+    use std::thread::{self, ThreadId};
+
+    struct RecordWake {
+        tag: u32,
+        events: Arc<Mutex<Vec<u32>>>,
+    }
+
+    impl Wake for RecordWake {
+        fn wake(self: Arc<Self>) {
+            self.events.lock().unwrap().push(self.tag);
+        }
+    }
+
+    struct HostFuture {
+        polls: u32,
+        threads: Arc<Mutex<Vec<ThreadId>>>,
+    }
+
+    impl Future for HostFuture {
+        type Output = ();
+        fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
+            crate::vm::tls::with(|state| assert!(state.is_some()));
+            self.threads.lock().unwrap().push(thread::current().id());
+            cx.waker().wake_by_ref();
+            self.polls += 1;
+            if self.polls < 3 {
+                Poll::Pending
+            } else {
+                Poll::Ready(())
+            }
+        }
+    }
+
+    fn instantiate(store: &mut Store<()>, module: &Module, host: Func) -> Result<Instance> {
+        let imports = [host.into()];
+        let mut init = Box::pin(Instance::new_async(store, module, &imports));
+        match init.as_mut().poll(&mut Context::from_waker(Waker::noop())) {
+            Poll::Ready(result) => result,
+            Poll::Pending => panic!("fixture without startup unexpectedly suspended"),
+        }
+    }
+
+    #[test]
+    fn worker_context_uses_each_poll_waker_and_restores_activations() -> Result<()> {
+        let mut config = Config::new();
+        config.macos_use_mach_ports(false);
+        let engine = Engine::new(&config)?;
+        let mut store = Store::new(&engine, ());
+        let threads = Arc::new(Mutex::new(Vec::new()));
+        let host_threads = threads.clone();
+        let host = Func::wrap_async(&mut store, move |_: Caller<'_, ()>, (): ()| {
+            Box::new(HostFuture {
+                polls: 0,
+                threads: host_threads.clone(),
+            })
+        });
+        let module = Module::new(
+            &engine,
+            "(module (import \"\" \"host\" (func $host)) (func (export \"run\") call $host))",
+        )?;
+        let instance = instantiate(&mut store, &module, host)?;
+        let run = instance.get_typed_func::<(), ()>(&mut store, "run")?;
+        let mut future = Box::pin(run.call_async(&mut store, ()));
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let waker = |tag| {
+            Waker::from(Arc::new(RecordWake {
+                tag,
+                events: events.clone(),
+            }))
+        };
+        let first = waker(1);
+        let before = wasmtime_thread_fiber_tls_suspensions();
+        assert!(
+            future
+                .as_mut()
+                .poll(&mut Context::from_waker(&first))
+                .is_pending()
+        );
+        assert!(
+            wasmtime_thread_fiber_tls_suspensions() > before,
+            "parked worker did not publish its activation list"
+        );
+        crate::vm::tls::with(|state| assert!(state.is_none()));
+        let second = waker(2);
+        let poller = thread::scope(|scope| {
+            scope
+                .spawn(|| {
+                    crate::vm::tls::with(|state| assert!(state.is_none()));
+                    assert!(
+                        future
+                            .as_mut()
+                            .poll(&mut Context::from_waker(&second))
+                            .is_pending()
+                    );
+                    crate::vm::tls::with(|state| assert!(state.is_none()));
+                    thread::current().id()
+                })
+                .join()
+                .unwrap()
+        });
+        let third = waker(3);
+        assert!(matches!(
+            future.as_mut().poll(&mut Context::from_waker(&third)),
+            Poll::Ready(Ok(()))
+        ));
+        drop(future);
+        crate::vm::tls::with(|state| assert!(state.is_none()));
+        assert_eq!(*events.lock().unwrap(), [1, 2, 3]);
+        let threads = threads.lock().unwrap();
+        assert_eq!(threads.len(), 3);
+        assert!(threads.iter().all(|t| *t == threads[0]));
+        assert_ne!(threads[0], thread::current().id());
+        assert_ne!(threads[0], poller);
+        Ok(())
+    }
+
+    #[test]
+    fn cancellation_reattaches_worker_tls_before_unwinding() -> Result<()> {
+        struct PendingDrop(Arc<core::sync::atomic::AtomicBool>);
+        impl Future for PendingDrop {
+            type Output = ();
+            fn poll(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<()> {
+                Poll::Pending
+            }
+        }
+        impl Drop for PendingDrop {
+            fn drop(&mut self) {
+                crate::vm::tls::with(|state| assert!(state.is_some()));
+                self.0.store(true, core::sync::atomic::Ordering::SeqCst);
+            }
+        }
+        let mut config = Config::new();
+        config.macos_use_mach_ports(false);
+        let engine = Engine::new(&config)?;
+        let mut store = Store::new(&engine, ());
+        let dropped = Arc::new(core::sync::atomic::AtomicBool::new(false));
+        let host_dropped = dropped.clone();
+        let host = Func::wrap_async(&mut store, move |_: Caller<'_, ()>, (): ()| {
+            Box::new(PendingDrop(host_dropped.clone()))
+        });
+        let module = Module::new(
+            &engine,
+            "(module (import \"\" \"host\" (func $host)) (func (export \"run\") call $host))",
+        )?;
+        let instance = instantiate(&mut store, &module, host)?;
+        let run = instance.get_typed_func::<(), ()>(&mut store, "run")?;
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let waker = Waker::from(Arc::new(RecordWake { tag: 0, events }));
+        let mut future = Box::pin(run.call_async(&mut store, ()));
+        assert!(
+            future
+                .as_mut()
+                .poll(&mut Context::from_waker(&waker))
+                .is_pending()
+        );
+        drop(future);
+        crate::vm::tls::with(|state| assert!(state.is_none()));
+        assert!(dropped.load(core::sync::atomic::Ordering::SeqCst));
+        Ok(())
+    }
+
+    #[test]
+    fn non_send_store_still_supports_synchronous_instantiation() -> Result<()> {
+        struct ThreadBound {
+            creator: ThreadId,
+            _not_send: core::marker::PhantomData<std::rc::Rc<()>>,
+        }
+        let mut config = Config::new();
+        config.macos_use_mach_ports(false);
+        let engine = Engine::new(&config)?;
+        let mut store = Store::new(
+            &engine,
+            ThreadBound {
+                creator: thread::current().id(),
+                _not_send: core::marker::PhantomData,
+            },
+        );
+        let host = Func::wrap(
+            &mut store,
+            |caller: Caller<'_, ThreadBound>| -> Result<()> {
+                ensure!(
+                    caller.data().creator == thread::current().id(),
+                    "synchronous Store data moved to worker"
+                );
+                Ok(())
+            },
+        );
+        let module = Module::new(
+            &engine,
+            "(module (import \"\" \"host\" (func $host)) (func $start call $host) (start $start))",
+        )?;
+        let imports = [host.into()];
+        Instance::new(&mut store, &module, &imports)?;
+        let mut linker = crate::Linker::new(&engine);
+        linker.define(&store, "", "host", host)?;
+        linker.instantiate_pre(&module)?.instantiate(&mut store)?;
+        #[cfg(feature = "component-model")]
+        {
+            let component = crate::component::Component::new(
+                &engine,
+                "(component (core module $m (func $start) (start $start)) (core instance (instantiate $m)))",
+            )?;
+            crate::component::Linker::new(&engine)
+                .instantiate_pre(&component)?
+                .instantiate(&mut store)?;
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn send_store_supports_async_instantiation_entrypoints() -> Result<()> {
+        let mut config = Config::new();
+        config.macos_use_mach_ports(false);
+        let engine = Engine::new(&config)?;
+        let creator = thread::current().id();
+        let mut store = Store::new(&engine, 0usize);
+        let host = Func::wrap(&mut store, move |mut caller: Caller<'_, usize>| {
+            assert_ne!(creator, thread::current().id());
+            *caller.data_mut() += 1;
+        });
+        let module = Module::new(
+            &engine,
+            "(module (import \"\" \"host\" (func $host)) (func $start call $host) (start $start))",
+        )?;
+        let mut cx = Context::from_waker(Waker::noop());
+        let imports = [host.into()];
+        {
+            let mut init = Box::pin(Instance::new_async(&mut store, &module, &imports));
+            assert!(matches!(init.as_mut().poll(&mut cx), Poll::Ready(Ok(_))));
+        }
+        let mut linker = crate::Linker::new(&engine);
+        linker.define(&store, "", "host", host)?;
+        {
+            let mut init = Box::pin(linker.instantiate_async(&mut store, &module));
+            assert!(matches!(init.as_mut().poll(&mut cx), Poll::Ready(Ok(_))));
+        }
+        let pre = linker.instantiate_pre(&module)?;
+        {
+            let mut init = Box::pin(pre.instantiate_async(&mut store));
+            assert!(matches!(init.as_mut().poll(&mut cx), Poll::Ready(Ok(_))));
+        }
+        assert_eq!(*store.data(), 3);
+        #[cfg(feature = "component-model")]
+        {
+            let component = crate::component::Component::new(
+                &engine,
+                "(component (core module $m (func $start) (start $start)) (core instance (instantiate $m)))",
+            )?;
+            let linker = crate::component::Linker::<usize>::new(&engine);
+            {
+                let mut init = Box::pin(linker.instantiate_async(&mut store, &component));
+                assert!(matches!(init.as_mut().poll(&mut cx), Poll::Ready(Ok(_))));
+            }
+            let pre = linker.instantiate_pre(&component)?;
+            let mut init = Box::pin(pre.instantiate_async(&mut store));
+            assert!(matches!(init.as_mut().poll(&mut cx), Poll::Ready(Ok(_))));
         }
         Ok(())
     }
@@ -506,14 +878,16 @@ impl Drop for StoreFiber<'_> {
 // crate. There are two members in `StoreFiber` which cause it to not be
 // `Send`. One is `suspend` and is entirely uninteresting.  This is just used to
 // manage `Suspend` when resuming, and requires raw pointers to get it to happen
-// easily.  Nothing too weird about the `Send`-ness, values aren't actually
-// crossing threads.
+// easily. The fiber backend synchronizes resume/yield values as part of its
+// transfer contract.
 //
-// The really interesting piece is `fiber`. Now the "fiber" here is actual
-// honest-to-god Rust code which we're moving around. What we're doing is the
-// equivalent of moving our thread's stack to another OS thread. Turns out we,
-// in general, have no idea what's on the stack and would generally have no way
-// to verify that this is actually safe to do!
+// The really interesting piece is `fiber`. With stock stack-switching
+// backends, a suspended stack may resume on another polling OS thread. With
+// the experimental OS-thread-backed backend, the stack stays on its dedicated
+// worker while the scheduler may resume it from another polling thread.
+// State reachable from the suspended stack must satisfy the applicable
+// thread-transfer safety contract. In general, we have no idea what's on the
+// stack and would have no way to verify this mechanically.
 //
 // Thankfully, though, Wasmtime has the power. Without being glib it's actually
 // worth examining what's on the stack. It's unfortunately not super-local to
@@ -608,7 +982,10 @@ impl FiberResumeState {
         store: &mut StoreOpaque,
         fiber: &mut StoreFiber<'_>,
     ) -> PriorFiberResumeState {
+        #[cfg(not(wasmtime_thread_fibers))]
         let tls = unsafe { self.tls.push() };
+        #[cfg(wasmtime_thread_fibers)]
+        let tls = self.tls;
         let mpk = swap_mpk_states(self.mpk);
         let async_guard_range = fiber
             .fiber()
@@ -661,27 +1038,30 @@ impl StoreOpaque {
         mem::replace(&mut self.fiber_async_state_mut().current_suspend, ptr)
     }
 
-    fn replace_current_future_cx(
-        &mut self,
-        ptr: Option<NonNull<Context<'static>>>,
-    ) -> Option<NonNull<Context<'static>>> {
+    fn replace_current_future_cx(&mut self, ptr: Option<PollContext>) -> Option<PollContext> {
         mem::replace(&mut self.fiber_async_state_mut().current_future_cx, ptr)
     }
 }
 
 struct PriorFiberResumeState {
+    #[cfg(not(wasmtime_thread_fibers))]
     tls: crate::runtime::vm::PreviousAsyncWasmCallState,
+    #[cfg(wasmtime_thread_fibers)]
+    tls: AsyncWasmCallState,
     mpk: Option<ProtectionMask>,
     stack_limit: usize,
     async_guard_range: Range<*mut u8>,
     current_suspend: Option<NonNull<WasmtimeSuspend>>,
-    current_future_cx: Option<NonNull<Context<'static>>>,
+    current_future_cx: Option<PollContext>,
     executor: Executor,
 }
 
 impl PriorFiberResumeState {
     unsafe fn replace(self, store: &mut StoreOpaque) -> FiberResumeState {
+        #[cfg(not(wasmtime_thread_fibers))]
         let tls = unsafe { self.tls.restore() };
+        #[cfg(wasmtime_thread_fibers)]
+        let tls = self.tls;
         let mpk = swap_mpk_states(self.mpk);
         // No need to save `_my_guard` since we can re-infer it from the fiber
         // that this state is attached to.
@@ -725,9 +1105,17 @@ fn swap_mpk_states(mask: Option<ProtectionMask>) -> Option<ProtectionMask> {
 fn resume_fiber<'a>(
     store: &mut StoreOpaque,
     fiber: &mut StoreFiber<'a>,
-    result: WasmtimeResume,
+    result: Result<PollContext>,
 ) -> Result<WasmtimeComplete, StoreFiberYield> {
     assert_eq!(store.id(), fiber.id);
+    #[cfg(wasmtime_thread_fibers)]
+    let result = (
+        result,
+        mem::replace(
+            &mut fiber.state.as_mut().unwrap().get_mut().tls,
+            AsyncWasmCallState::new(),
+        ),
+    );
 
     struct Restore<'a, 'b> {
         store: &'b mut StoreOpaque,
@@ -756,6 +1144,11 @@ fn resume_fiber<'a>(
         restore.fiber.fiber().unwrap().resume(result)
     };
 
+    #[cfg(wasmtime_thread_fibers)]
+    let result = result.map_err(|yield_| {
+        fiber.state.as_mut().unwrap().get_mut().tls = yield_.tls;
+        yield_.reason
+    });
     match &result {
         // The fiber has finished, so recycle its stack by disposing of the
         // underlying fiber itself.
@@ -796,6 +1189,8 @@ fn resume_fiber<'a>(
 /// The returned `StoreFiber<'a>` structure is unconditionally `Send` but the
 /// send-ness is actually a function of `S`. When `S` is statically known to be
 /// `Send` then use the safe [`make_fiber`] function.
+/// With thread-backed fibers, the caller must guarantee that all reachable
+/// Store state can transfer to the worker, even if the future is polled locally.
 pub(crate) unsafe fn make_fiber_unchecked<'a, S>(
     store: &mut S,
     fun: impl FnOnce(&mut S) -> Result<()> + Send + Sync + 'a,
@@ -807,10 +1202,30 @@ where
     let engine = opaque.engine().clone();
     let executor = Executor::new(&engine)?;
     let id = opaque.id();
-    let stack = opaque.allocate_fiber_stack()?;
     let track_pkey_context_switch = opaque.has_pkey();
+    #[cfg(wasmtime_thread_fibers)]
+    ensure!(
+        !track_pkey_context_switch,
+        "thread-backed execution does not support protection keys"
+    );
+    let stack = opaque.allocate_fiber_stack()?;
     let store = &raw mut *store;
-    let fiber = Fiber::new(stack, move |result: WasmtimeResume, suspend| {
+    let run = move |result: WasmtimeResume, suspend: &mut WasmtimeSuspend| {
+        #[cfg(wasmtime_thread_fibers)]
+        let result = {
+            enter_worker_tls(result.1);
+            result.0
+        };
+        #[cfg(wasmtime_thread_fibers)]
+        struct ResetWorkerTls;
+        #[cfg(wasmtime_thread_fibers)]
+        impl Drop for ResetWorkerTls {
+            fn drop(&mut self) {
+                leave_worker_tls().assert_null();
+            }
+        }
+        #[cfg(wasmtime_thread_fibers)]
+        let _worker_tls = ResetWorkerTls;
         let future_cx = match result {
             Ok(cx) => cx,
             // Cancelled before we started? Just return.
@@ -858,7 +1273,13 @@ where
         let reset = ResetCurrentPointersToNull(store_ref);
 
         fun(reset.0)
-    });
+    };
+    #[cfg(not(wasmtime_thread_fibers))]
+    let fiber = Fiber::new(stack, run);
+    // SAFETY: the caller guarantees exclusive access and transferable borrowed
+    // state for the lifetime of this fiber, including its cancellation/join.
+    #[cfg(wasmtime_thread_fibers)]
+    let fiber = unsafe { Fiber::new_unchecked(stack, run) };
     let fiber = match fiber {
         Ok(fiber) => fiber,
         Err((e, stack)) => {
@@ -895,6 +1316,26 @@ pub(crate) async fn on_fiber<S, R>(
     func: impl FnOnce(&mut S) -> R + Send + Sync,
 ) -> Result<R>
 where
+    S: AsStoreOpaque + Send + ?Sized,
+    R: Send + Sync,
+{
+    // SAFETY: S is Send and the fiber cannot outlive this exclusive borrow.
+    unsafe { on_fiber_unchecked(store, func).await }
+}
+
+/// Run borrowed state on a fiber without a static Send bound.
+///
+/// # Safety
+///
+/// With thread-backed fibers, all state reachable through `store` must be safe
+/// to transfer to the worker. The future retains exclusive access until the
+/// worker is joined, including when dropped. Stock fibers only require that
+/// the future is Send exactly when S is Send.
+pub(crate) async unsafe fn on_fiber_unchecked<S, R>(
+    store: &mut S,
+    func: impl FnOnce(&mut S) -> R + Send + Sync,
+) -> Result<R>
+where
     S: AsStoreOpaque + ?Sized,
     R: Send + Sync,
 {
@@ -904,11 +1345,8 @@ where
 
     let mut result = None;
 
-    // SAFETY: the `StoreFiber` returned by `make_fiber_unchecked` is `Send`
-    // despite we not actually knowing here whether `S` is `Send` or not. That
-    // is safe here, however, because this function is already conditionally
-    // `Send` based on `S`. Additionally `fiber` doesn't escape this function,
-    // so the future-of-this-function is still correctly `Send`-vs-not.
+    // SAFETY: the caller upholds the transfer contract, and the fiber does not
+    // escape this future or its exclusive Store borrow.
     let fiber = unsafe {
         make_fiber_unchecked(store, |store| {
             result = Some(func(store));
@@ -988,8 +1426,10 @@ impl<'b> Future for FiberFuture<'_, 'b> {
         // satisfied by the users of this in the `BlockingContext` structure
         // where the lifetime parameters there are always more constrained than
         // they are here.
-        let cx: &mut Context<'static> = unsafe { change_context_lifetime(cx) };
-        let cx = NonNull::from(cx);
+        #[cfg(not(wasmtime_thread_fibers))]
+        let cx = NonNull::from(unsafe { change_context_lifetime(cx) });
+        #[cfg(wasmtime_thread_fibers)]
+        let cx = cx.waker().clone();
 
         match resume_fiber(me.store, me.fiber.as_mut().unwrap(), Ok(cx)) {
             Ok(Ok(())) => Poll::Ready(Ok(None)),
@@ -1020,6 +1460,7 @@ impl Drop for FiberFuture<'_, '_> {
 /// being used to determine whether it's actually safe or not. See docs on
 /// callers of this function. The purpose of this is to scope the `transmute` to
 /// as small an operation as possible.
+#[cfg(not(wasmtime_thread_fibers))]
 unsafe fn change_context_lifetime<'a, 'b>(cx: &'a mut Context<'_>) -> &'a mut Context<'b> {
     // SAFETY: See the function documentation, this is not safe in general.
     unsafe { mem::transmute::<&mut Context<'_>, &mut Context<'b>>(cx) }

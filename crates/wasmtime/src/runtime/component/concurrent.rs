@@ -118,6 +118,22 @@ mod error_contexts;
 mod func;
 mod future_stream_any;
 mod futures_and_streams;
+#[cfg(all(
+    test,
+    wasmtime_thread_fibers,
+    feature = "cranelift",
+    feature = "wat",
+    feature = "gc"
+))]
+mod p3_thread_tests;
+#[cfg(all(
+    test,
+    wasmtime_thread_fibers,
+    feature = "cranelift",
+    feature = "wat",
+    feature = "gc"
+))]
+mod panic_thread_tests;
 pub(crate) mod table;
 #[cfg(feature = "task-group-hook")]
 mod task_group_hook;
@@ -125,6 +141,14 @@ mod task_group_hook;
 mod task_group_hook_disabled;
 #[cfg(not(feature = "task-group-hook"))]
 use task_group_hook_disabled as task_group_hook;
+#[cfg(all(
+    test,
+    wasmtime_thread_fibers,
+    feature = "cranelift",
+    feature = "wat",
+    feature = "gc"
+))]
+mod thread_tests;
 pub(crate) mod tls;
 
 /// Constant defined in the Component Model spec to indicate that the async

@@ -48,6 +48,18 @@ Documentation on Wasmtime's currently supported versions can be found [in the
 online book
 documentation](https://docs.wasmtime.dev/stability-release.html#current-versions).
 
+### Experimental thread-backed fibers packages
+
+In the `phillipcaofph/wasmtime` fork, pushes to
+`experiment/thread-backed-fibers` build C API archives for Linux, macOS, and Windows and publish
+them to the public `thread-backed-fibers` prerelease. The matching .NET package is published
+separately from the `phillipcaofph/wasmtime-dotnet` fork by pushing a tag such as
+`nuget-experiment-51.0.0-experiment.1` after the native prerelease has updated. It is published
+as `Wasmtime.Experimental` on NuGet and embeds those native archives. These are experimental
+packages, not official Wasmtime releases. The workflow enables
+`--cfg wasmtime_thread_fibers` and packages the installed C API headers and libraries
+as `.tar.xz` archives on Linux/macOS and `.zip` archives on Windows.
+
 ## Example
 
 If you've got the [Rust compiler
