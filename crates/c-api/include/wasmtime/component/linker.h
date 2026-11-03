@@ -251,6 +251,14 @@ wasmtime_component_linker_instantiate_async(
 
 /// Type of the async callback used in
 /// #wasmtime_component_linker_instance_add_func_async
+///
+/// `context` remains valid, and may be used from the continuation callback
+/// returned in `continuation_ret`, until the continuation reports completion
+/// or its finalizer runs. The continuation is polled on the same execution
+/// context as the call, while the store is otherwise unavailable to other
+/// users, so store operations such as
+/// #wasmtime_component_resource_host_to_any may be issued from it with
+/// `context`. `results` stays valid for the same period; `args` does not.
 typedef void (*wasmtime_component_func_async_callback_t)(
     void *env, wasmtime_context_t *context,
     const wasmtime_component_func_type_t *ty, wasmtime_component_val_t *args,
