@@ -9,6 +9,7 @@
 
 #include <stdint.h>
 #include <wasm.h>
+#include <wasmtime/async.h>
 #include <wasmtime/component/types/resource.h>
 #include <wasmtime/store.h>
 
@@ -88,6 +89,33 @@ bool wasmtime_component_resource_any_owned(
 WASM_API_EXTERN
 wasmtime_error_t *wasmtime_component_resource_any_drop(
     wasmtime_context_t *ctx, const wasmtime_component_resource_any_t *resource);
+
+#ifdef WASMTIME_FEATURE_COMPONENT_MODEL_ASYNC
+
+/// \brief Drops a component resource asynchronously.
+///
+/// This is the same as #wasmtime_component_resource_any_drop except that it is
+/// for stores that require `*_async` entry points (for example a store whose
+/// component was instantiated with asynchronous host functions), where an owned
+/// resource's destructor must run asynchronously.
+///
+/// The result is a future that is owned by the caller. Poll it with
+/// #wasmtime_call_future_poll until that returns `true`, then delete it with
+/// #wasmtime_call_future_delete. If the drop fails, `*error_ret` is set to an
+/// error the caller owns; it is left untouched otherwise.
+///
+/// `resource` may be deleted as soon as this function returns. `context` and
+/// `error_ret` must stay valid until the future is deleted, and the store must
+/// not be used otherwise while the future is alive. Deleting the future before
+/// it completes may leave the resource removed from the store with its
+/// destructor not run.
+WASM_API_EXTERN wasmtime_call_future_t *
+wasmtime_component_resource_any_drop_async(
+    wasmtime_context_t *context,
+    const wasmtime_component_resource_any_t *resource,
+    wasmtime_error_t **error_ret);
+
+#endif // WASMTIME_FEATURE_COMPONENT_MODEL_ASYNC
 
 /// \brief Deallocates a component resource.
 ///

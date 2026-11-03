@@ -1153,6 +1153,133 @@ TEST(component, value_guest_resource) {
   EXPECT_EQ(last_rep.get_u32(), 101);
 }
 
+#ifdef WASMTIME_FEATURE_COMPONENT_MODEL_ASYNC
+
+static void wait_for(wasmtime_call_future_t *future) {
+  while (!wasmtime_call_future_poll(future)) {
+  }
+  wasmtime_call_future_delete(future);
+}
+
+static uint32_t call_u32_async(Store::Context cx, Func f, const Val *arg) {
+  Val result(false);
+  wasmtime_error_t *error = nullptr;
+  wait_for(wasmtime_component_func_call_async(
+      f.capi(), cx.capi(), arg ? Val::to_capi(arg) : nullptr, arg ? 1 : 0,
+      Val::to_capi(&result), 1, &error));
+  EXPECT_EQ(error, nullptr);
+  EXPECT_TRUE(result.is_u32());
+  return result.get_u32();
+}
+
+TEST(component, value_guest_resource_drop_async) {
+  Engine engine;
+  Linker linker(engine);
+  Store store(engine);
+  auto context = store.context();
+
+  Component c = Component::compile(engine,
+                                   R"(
+(component
+  (import "noop" (func $noop))
+  (core func $noop_lower (canon lower (func $noop)))
+  (core module $a
+    (global $g (mut i32) (i32.const 0))
+
+    (func (export "dtor") (param i32) (global.set $g (local.get 0)))
+    (func (export "last-dtor-rep") (result i32) global.get $g)
+  )
+  (core instance $a (instantiate $a))
+  (type $r' (resource (rep i32) (dtor (core func $a "dtor"))))
+  (export $r "r" (type $r'))
+
+  (core func $new (canon resource.new $r))
+
+  (core module $b
+    (import "" "new" (func $new (param i32) (result i32)))
+    (import "" "noop" (func $noop))
+
+    (func (export "new") (param i32) (result i32)
+      call $noop
+      local.get 0
+      call $new)
+  )
+  (core instance $b (instantiate $b
+    (with "" (instance
+      (export "new" (func $new))
+      (export "noop" (func $noop_lower))
+    ))
+  ))
+
+  (func (export "new") (param "x" u32) (result (own $r))
+    (canon lift (core func $b "new")))
+  (func (export "last-dtor-rep") (result u32)
+    (canon lift (core func $a "last-dtor-rep")))
+)
+)")
+                    .unwrap();
+
+  // An async host function makes the store require `*_async` entry points.
+  auto *root = wasmtime_component_linker_root(linker.capi());
+  wasmtime_component_func_async_callback_t noop =
+      [](void *, wasmtime_context_t *, const wasmtime_component_func_type_t *,
+         wasmtime_component_val_t *, size_t, wasmtime_component_val_t *,
+         size_t, wasmtime_error_t **, wasmtime_async_continuation_t *cont) {
+        cont->callback = [](void *) -> bool { return true; };
+        cont->env = nullptr;
+        cont->finalizer = nullptr;
+      };
+  auto *err = wasmtime_component_linker_instance_add_func_async(
+      root, "noop", 4, noop, nullptr, nullptr);
+  EXPECT_EQ(err, nullptr);
+  wasmtime_component_linker_instance_delete(root);
+
+  wasmtime_component_instance_t raw_instance;
+  wasmtime_error_t *error = nullptr;
+  wait_for(wasmtime_component_linker_instantiate_async(
+      linker.capi(), context.capi(), c.capi(), &raw_instance, &error));
+  ASSERT_EQ(error, nullptr);
+  auto instance = Instance(raw_instance);
+
+  auto new_index = *instance.get_export_index(context, nullptr, "new");
+  auto last_index =
+      *instance.get_export_index(context, nullptr, "last-dtor-rep");
+  auto new_func = *instance.get_func(context, new_index);
+  auto last_func = *instance.get_func(context, last_index);
+
+  Val arg(uint32_t(100));
+  Val res(false);
+  wait_for(wasmtime_component_func_call_async(
+      new_func.capi(), context.capi(), Val::to_capi(&arg), 1,
+      Val::to_capi(&res), 1, &error));
+  ASSERT_EQ(error, nullptr);
+  ASSERT_TRUE(res.is_resource());
+  const auto &resource = res.get_resource();
+  EXPECT_TRUE(resource.owned());
+
+  // The synchronous drop is refused on this store and changes nothing.
+  EXPECT_FALSE(resource.drop(context));
+  EXPECT_EQ(call_u32_async(context, last_func, nullptr), 0);
+
+  // The asynchronous drop runs the guest destructor. The resource handle may
+  // be deleted while the future is alive.
+  auto *clone = wasmtime_component_resource_any_clone(resource.capi());
+  auto *future =
+      wasmtime_component_resource_any_drop_async(context.capi(), clone, &error);
+  wasmtime_component_resource_any_delete(clone);
+  wait_for(future);
+  EXPECT_EQ(error, nullptr);
+  EXPECT_EQ(call_u32_async(context, last_func, nullptr), 100);
+
+  // A second drop of the same resource fails and reports the error.
+  wait_for(wasmtime_component_resource_any_drop_async(
+      context.capi(), resource.capi(), &error));
+  EXPECT_NE(error, nullptr);
+  wasmtime_error_delete(error);
+}
+
+#endif // WASMTIME_FEATURE_COMPONENT_MODEL_ASYNC
+
 TEST(component, resources) {
   ResourceHost r1(true, 1, 2);
   EXPECT_TRUE(r1.owned());

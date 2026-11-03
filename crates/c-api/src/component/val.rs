@@ -450,6 +450,24 @@ pub extern "C" fn wasmtime_component_resource_any_drop(
 }
 
 #[unsafe(no_mangle)]
+#[cfg(feature = "component-model-async")]
+pub extern "C" fn wasmtime_component_resource_any_drop_async<'a>(
+    mut store: WasmtimeStoreContextMut<'a>,
+    resource: &wasmtime_component_resource_any_t,
+    error_ret: &'a mut *mut wasmtime_error_t,
+) -> Box<crate::wasmtime_call_future_t<'a>> {
+    // `ResourceAny` is `Copy`, so the caller may delete its box once this
+    // function returns.
+    let resource = resource.resource;
+    let fut = Box::pin(async move {
+        if let Err(err) = resource.resource_drop_async(&mut store).await {
+            *error_ret = Box::into_raw(Box::new(wasmtime_error_t::from(err)));
+        }
+    });
+    Box::new(crate::wasmtime_call_future_t::new(fut))
+}
+
+#[unsafe(no_mangle)]
 pub extern "C" fn wasmtime_component_resource_any_delete(
     _resource: Option<Box<wasmtime_component_resource_any_t>>,
 ) {
