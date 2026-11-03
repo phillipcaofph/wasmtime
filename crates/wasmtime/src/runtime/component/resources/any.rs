@@ -255,7 +255,8 @@ impl ResourceAny {
     /// Exactly one of the following must be called for each [`ResourceAny`],
     /// depending on how the store is being driven:
     ///
-    /// * [`ResourceAny::resource_drop`] for synchronous stores.
+    /// * [`ResourceAny::resource_drop`] for synchronous stores, and for
+    ///   borrows on any store (dropping a borrow never runs a destructor).
     /// * `ResourceAny::resource_drop_async` for [async](crate#async) stores
     ///   when a `StoreContextMut` is available.
     /// * `ResourceAny::resource_drop_concurrent` when only an `Accessor` is
@@ -272,7 +273,12 @@ impl ResourceAny {
     /// `call_async` invocation.
     pub fn resource_drop(self, mut store: impl AsContextMut) -> Result<()> {
         let mut store = store.as_context_mut();
-        store.0.validate_sync_call()?;
+        // Dropping a borrow only updates host table state: no destructor or
+        // wasm can run, so it is allowed on stores that otherwise require
+        // `*_async` entry points.
+        if self.owned {
+            store.0.validate_sync_call()?;
+        }
         self.resource_drop_impl(&mut store)
     }
 

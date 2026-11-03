@@ -249,3 +249,72 @@ async fn async_disallows_resource_any_drop() -> Result<()> {
 
     Ok(())
 }
+
+#[tokio::test]
+async fn async_store_allows_borrow_drop() -> Result<()> {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use wasmtime::component::{Resource, ResourceType, Val};
+
+    let mut store = async_store();
+
+    // A synthetic borrow (no host table entry) can be dropped synchronously.
+    let synthetic = Resource::<u32>::new_borrow(1).try_into_resource_any(&mut store)?;
+    synthetic.resource_drop(&mut store)?;
+
+    // An owned resource still requires the async drop.
+    let owned = Resource::<u32>::new_own(2).try_into_resource_any(&mut store)?;
+    assert!(owned.resource_drop(&mut store).is_err());
+    owned.resource_drop_async(&mut store).await?;
+
+    // A borrow received by an async host import is backed by a host table
+    // entry and must be dropped before the import returns; the sync drop is
+    // allowed for it on this async-required store.
+    let component = Component::new(
+        store.engine(),
+        r#"
+            (component
+                (import "t" (type $t (sub resource)))
+                (import "peek" (func $peek (param "r" (borrow $t))))
+                (core func $peek_lower (canon lower (func $peek)))
+                (core module $m
+                    (import "" "peek" (func $peek (param i32)))
+                    (func (export "run") (param i32)
+                        local.get 0
+                        call $peek)
+                )
+                (core instance $i (instantiate $m
+                    (with "" (instance (export "peek" (func $peek_lower))))
+                ))
+                (func (export "run") (param "r" (own $t))
+                    (canon lift (core func $i "run")))
+            )
+        "#,
+    )?;
+    let seen = Arc::new(AtomicUsize::new(0));
+    let mut linker = Linker::new(store.engine());
+    linker
+        .root()
+        .resource("t", ResourceType::host::<u32>(), |_, _| Ok(()))?;
+    let peek_seen = seen.clone();
+    linker
+        .root()
+        .func_new_async("peek", move |mut store, _, params, _| {
+            let seen = peek_seen.clone();
+            Box::new(async move {
+                let Val::Resource(borrow) = params[0] else {
+                    panic!("expected a resource");
+                };
+                assert!(!borrow.owned());
+                borrow.resource_drop(&mut store)?;
+                seen.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            })
+        })?;
+    let instance = linker.instantiate_async(&mut store, &component).await?;
+    let run = instance.get_typed_func::<(Resource<u32>,), ()>(&mut store, "run")?;
+    run.call_async(&mut store, (Resource::new_own(3),)).await?;
+    assert_eq!(seen.load(Ordering::SeqCst), 1);
+
+    Ok(())
+}
